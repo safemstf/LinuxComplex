@@ -95,27 +95,47 @@ static uint32_t *clone_page_directory(uint32_t *src_pd)
  * SYSCALL IMPLEMENTATIONS
  * ================================================================ */
 
+/* Assembly function to switch to a task and NEVER return (for dying tasks) */
+extern void task_switch_and_die(task_t *new_task);
+
 void sys_exit(int code)
 {
+    terminal_writestring("\n[sys_exit] ENTERED\n");
+
     if (!current_task || current_task == kernel_task)
     {
-        return; /* Can't exit kernel */
+        terminal_writestring("[sys_exit] ERROR: no task or kernel task\n");
+        return;
     }
 
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-    terminal_writestring("\n[EXIT] Process ");
-    terminal_write_dec(current_task->pid);
-    terminal_writestring(" (");
-    terminal_writestring(current_task->name);
-    terminal_writestring(") exited with code ");
-    terminal_write_dec(code);
+    task_t *dying = current_task;
+
+    terminal_writestring("[sys_exit] Dying task: ");
+    terminal_writestring(dying->name);
     terminal_writestring("\n");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 
-    /* Mark as zombie and yield */
-    task_exit(code);
+    /* Mark zombie and store exit code */
+    dying->exit_code = code;
+    dying->state = TASK_ZOMBIE;
 
-    /* Never returns */
+    /* Remove from run queues */
+    scheduler_remove_task(dying);
+
+    /* Wake up parent if waiting */
+    if (dying->parent && dying->parent->state == TASK_BLOCKED)
+    {
+        task_unblock(dying->parent);
+    }
+
+    /*
+     * CRITICAL:
+     * We are still running on the dying task's kernel stack.
+     * The only safe thing to do is yield to the scheduler.
+     */
+    scheduler_schedule();
+
+    /* We must never return here */
+    __builtin_unreachable();
 }
 
 int sys_write(const char *msg)
@@ -157,15 +177,8 @@ int sys_fork(void)
 {
     if (!current_task)
     {
-        terminal_writestring("[FORK] ERROR: No current task\n");
         return -1;
     }
-
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
-    terminal_writestring("[FORK] Parent PID ");
-    terminal_write_dec(current_task->pid);
-    terminal_writestring(" is forking...\n");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 
     /* Create child task structure */
     task_t *child = (task_t *)kmalloc(sizeof(task_t));
@@ -223,12 +236,6 @@ int sys_fork(void)
     extern void scheduler_add_task(task_t * task);
     scheduler_add_task(child);
 
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-    terminal_writestring("[FORK] ✓ Created child PID ");
-    terminal_write_dec(child->pid);
-    terminal_writestring("\n");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-
     /* Return child PID to parent, 0 to child */
     return child->pid;
 }
@@ -240,16 +247,9 @@ int sys_wait(int *status)
         return -1;
     }
 
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_BLUE, VGA_COLOR_BLACK));
-    terminal_writestring("[WAIT] Parent PID ");
-    terminal_write_dec(current_task->pid);
-    terminal_writestring(" waiting for children...\n");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-
     /* Check if we have any children */
     if (!current_task->first_child)
     {
-        terminal_writestring("[WAIT] No children to wait for\n");
         return -1; /* No children */
     }
 
@@ -275,16 +275,6 @@ int sys_wait(int *status)
                     *status = exit_code;
                 }
 
-                terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-                terminal_writestring("[WAIT] ✓ Parent ");
-                terminal_write_dec(current_task->pid);
-                terminal_writestring(" reaped child ");
-                terminal_write_dec(pid);
-                terminal_writestring(" (exit code: ");
-                terminal_write_dec(exit_code);
-                terminal_writestring(")\n");
-                terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-
                 /* Remove from children list and clean up */
                 task_remove_child(current_task, child);
 
@@ -298,7 +288,6 @@ int sys_wait(int *status)
         }
 
         /* No zombie children found - block and wait */
-        terminal_writestring("[WAIT] Blocking until child exits...\n");
         task_block();
         task_yield();
 
@@ -311,23 +300,13 @@ int sys_exec(const char *path)
     /* Validate pointer */
     if ((uint32_t)path >= 0xC0000000)
     {
-        terminal_writestring("[EXEC] Invalid path pointer\n");
         return -1;
     }
-
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
-    terminal_writestring("[EXEC] Loading program: ");
-    terminal_writestring(path);
-    terminal_writestring("\n");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 
     /* Open file */
     int fd = vfs_open(path, O_RDONLY);
     if (fd < 0)
     {
-        terminal_writestring("[EXEC] File not found: ");
-        terminal_writestring(path);
-        terminal_writestring("\n");
         return -1;
     }
 
@@ -336,7 +315,6 @@ int sys_exec(const char *path)
     if (!elf_data)
     {
         vfs_close(fd);
-        terminal_writestring("[EXEC] Out of memory\n");
         return -1;
     }
 
@@ -346,29 +324,8 @@ int sys_exec(const char *path)
     if (bytes_read <= 0)
     {
         kfree(elf_data);
-        terminal_writestring("[EXEC] Failed to read file\n");
         return -1;
     }
-
-    terminal_writestring("[EXEC] Read ");
-    terminal_write_dec(bytes_read);
-    terminal_writestring(" bytes\n");
-
-    /* DEBUG: Verify ELF data at offset 0x1000 */
-    terminal_writestring("[EXEC_DEBUG] ELF magic: ");
-    uint8_t *elf_bytes = (uint8_t *)elf_data;
-    for (int i = 0; i < 4; i++) {
-        terminal_write_hex(elf_bytes[i]);
-        terminal_putchar(' ');
-    }
-    terminal_writestring("\n");
-
-    terminal_writestring("[EXEC_DEBUG] Data at offset 0x1000: ");
-    for (int i = 0; i < 8; i++) {
-        terminal_write_hex(elf_bytes[0x1000 + i]);
-        terminal_putchar(' ');
-    }
-    terminal_writestring("\n");
 
     /* If we're in kernel mode (shell), create a NEW user task */
     if (!current_task || current_task->ring == 0)
@@ -379,23 +336,14 @@ int sys_exec(const char *path)
 
         if (!user_task)
         {
-            terminal_writestring("[EXEC] Failed to create user task\n");
             return -1;
         }
-
-        terminal_writestring("[EXEC] Task PID: ");
-        terminal_write_dec(user_task->pid);
-        terminal_writestring("\n");
 
         /* Add to scheduler */
         scheduler_add_task(user_task);
 
-        terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-        terminal_writestring("[EXEC] ✓ Task added to scheduler\n");
-        terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-
-        /* Return success - caller can yield if desired */
-        return 0;
+        /* Return the PID so caller can wait on it */
+        return (int)user_task->pid;
     }
 
     /* If we're already in user mode, replace current process */
@@ -403,22 +351,13 @@ int sys_exec(const char *path)
     if (!elf_load(current_task, elf_data))
     {
         kfree(elf_data);
-        terminal_writestring("[EXEC] Invalid ELF file\n");
         return -1;
     }
 
     kfree(elf_data);
 
-    terminal_writestring("[EXEC] ELF loaded, entry point: 0x");
-    terminal_write_hex(current_task->entry_point);
-    terminal_writestring("\n");
-
     /* Setup user context to jump to new entry point */
     task_setup_user_context(current_task);
-
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-    terminal_writestring("[EXEC] ✓ Ready to execute new program\n");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 
     /* Return 0 - but modified context means we'll jump to new program on syscall return */
     return 0;
@@ -430,13 +369,6 @@ int sys_exec(const char *path)
 
 void syscall_handler(struct registers *regs)
 {
-    /* Debug output (can be removed later) */
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_MAGENTA, VGA_COLOR_BLACK));
-    terminal_writestring("[SYSCALL] Number=");
-    terminal_write_dec(regs->eax);
-    terminal_writestring("\n");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-
     uint32_t syscall_num = regs->eax;
 
     /* Bounds check */

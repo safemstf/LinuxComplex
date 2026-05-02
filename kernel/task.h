@@ -109,9 +109,13 @@ typedef struct task
     struct task *first_child;  /* First child in linked list */
     struct task *next_sibling; /* Next sibling */
 
-    /* Scheduler queue */
-    struct task *next; /* Next in scheduler queue */
+    /* Task list (all tasks) */
+    struct task *next; /* Next in global task list */
+
+    /* Scheduler ready queue */
+    struct task *sched_next; /* Next in scheduler ready queue */
     bool first_run;
+    bool context_saved;
     
     /* Exit status */
     int exit_code; /* Return value when task exits */
@@ -134,7 +138,7 @@ task_t *task_create_user(const char *name, void *elf_data, uint32_t priority);
 /* Setup user mode context for a task */
 void task_setup_user_context(task_t *task);
 
-/* Destroy a task */
+/* Destroy a task */ //todo: zombie_queue_add(child); repear que implementation would make life easier
 void task_destroy(task_t *task);
 
 /* Get current running task */
@@ -167,6 +171,13 @@ void task_add_child(task_t *parent, task_t *child);
 
 /* Remove child from parent's child list */
 void task_remove_child(task_t *parent, task_t *child);
+
+/* ================================================================
+ * TASK QUERIES
+ * ================================================================ */
+
+/* Find a task by PID */
+task_t *task_find_by_pid(uint32_t pid);
 
 /* ================================================================
  * KERNEL TASK

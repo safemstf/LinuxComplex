@@ -949,12 +949,12 @@ static void cmd_writesector(const char *args)
     kfree(buffer);
 }
 
-static void cmd_exec(const char *args)
+void cmd_exec(const char *args)
 {
     if (!args || !*args)
     {
         terminal_writestring("Usage: exec <program>\n");
-        terminal_writestring("Example: exec /bin/hello\n");
+        terminal_writestring("Example: exec bin/hello\n");
         return;
     }
 
@@ -962,22 +962,37 @@ static void cmd_exec(const char *args)
     while (*args == ' ')
         args++;
 
-    /* Call sys_exec to create and add the task */
-    int result = sys_exec(args);
-    
-    if (result < 0)
+    /* Call sys_exec to create and add the task - returns PID on success */
+    int child_pid = sys_exec(args);
+
+    if (child_pid <= 0)
     {
         terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
-        terminal_writestring("[EXEC] Failed to execute program\n");
+        terminal_writestring("exec: ");
+        terminal_writestring(args);
+        terminal_writestring(": not found\n");
         terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
         return;
     }
 
-    /* Task was created and added to scheduler successfully */
-    terminal_writestring("[EXEC] Program will start running soon...\n\n");
-    
-    /* Yield to give the new task a chance to run */
-    task_yield();
+    /* Get the child task structure */
+    task_t *child = task_find_by_pid((uint32_t)child_pid);
+    if (!child)
+    {
+        return;
+    }
+
+    /* Wait for child to exit */
+    while (child->state != TASK_ZOMBIE)
+    {
+        scheduler_schedule();  /* Let child run, possibly multiple cycles */
+    }
+
+    /* Extra scheduler cycle to ensure CPU stack is no longer on child */
+    scheduler_schedule();
+
+    /* Safe to destroy child now */
+    task_destroy(child);
 }
 
 extern void user_main(void);
@@ -1616,5 +1631,18 @@ void shell_run(void)
     {
         shell_process_input();
         __asm__ volatile("hlt");
+    }
+}
+
+/* Shell task entry point - runs as a proper schedulable task */
+void shell_task_entry(void)
+{
+    shell_display_prompt();
+
+    while (1)
+    {
+        shell_process_input();
+        /* Yield to other tasks instead of halting */
+        task_yield();
     }
 }

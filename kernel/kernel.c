@@ -245,9 +245,6 @@ void kernel_main(void)
     shell_run();
 
     /* Should never reach here */
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_RED, VGA_COLOR_BLACK));
-    terminal_writestring("\n\n[KERNEL] FATAL: Shell returned unexpectedly!\n");
-
     while (1)
     {
         __asm__ volatile("cli; hlt");

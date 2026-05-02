@@ -9,7 +9,18 @@ void main(void)
 {
     write("\n");
     write("Hello from user space!\n");
-    write("PID: ");
-    print_num(getpid());
-    write("\n\n");
+    write("Getting PID...\n");
+
+    int pid = getpid();
+
+    write("Got PID, printing digit...\n");
+
+    /* Print single digit (avoids division) */
+    char digit = '0' + (pid & 0xF);  /* Just show lower nibble as hex digit */
+    char buf[2] = {digit, '\0'};
+    write("PID (low nibble): ");
+    write(buf);
+    write("\n");
+
+    write("Program completed successfully!\n");
 }

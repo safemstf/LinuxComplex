@@ -36,10 +36,9 @@ extern void task_switch_asm(task_t *old_task, task_t *new_task);
 /* ================================================================
  * INITIALIZATION
  * ================================================================ */
-/* Add this idle loop function at the top of task.c, before task_init() */
+/* Idle loop - runs when no other tasks are ready */
 static void kernel_idle_loop(void)
 {
-    terminal_writestring("[KERNEL_IDLE] Idle task running\n");
     while (1)
     {
         __asm__ volatile("hlt"); /* Halt until next interrupt */
@@ -68,7 +67,8 @@ void task_init(void)
     strcpy(kernel_task->name, "kernel_idle");
     kernel_task->state = TASK_RUNNING;
     kernel_task->priority = 255;
-    kernel_task->ring = 0; /* Kernel mode */
+    kernel_task->ring = 0;        /* Kernel mode */
+    kernel_task->time_slice = 10; /* Give kernel task initial time slice */
     kernel_task->page_directory = vmm_current_as->page_dir;
     kernel_task->parent = NULL;
     kernel_task->parent_pid = 0;
@@ -76,6 +76,7 @@ void task_init(void)
     kernel_task->next_sibling = NULL;
     kernel_task->next = NULL;
     kernel_task->waited = false;
+    kernel_task->context_saved = false;
 
     /* Allocate kernel stack for idle task */
     uint32_t raw_kstack = (uint32_t)kmalloc(4096 + 4096);
@@ -216,17 +217,6 @@ task_t *task_create(const char *name, void (*entry_point)(void), uint32_t priori
     task->next = task_list_head;
     task_list_head = task;
 
-    /* Debug output */
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-    terminal_writestring("[TASK] Created task '");
-    terminal_writestring(task->name);
-    terminal_writestring("' (PID ");
-    char buf[16];
-    itoa(task->pid, buf);
-    terminal_writestring(buf);
-    terminal_writestring(")\n");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-
     return task;
 }
 
@@ -235,8 +225,6 @@ task_t *task_create(const char *name, void (*entry_point)(void), uint32_t priori
  * ================================================================ */
 task_t *task_create_user(const char *name, void *elf_data, uint32_t priority)
 {
-    terminal_writestring("[TASK_CREATE_USER] Allocating task structure...\n");
-
     task_t *task = kmalloc(sizeof(task_t));
     if (!task)
         return NULL;
@@ -253,9 +241,7 @@ task_t *task_create_user(const char *name, void *elf_data, uint32_t priority)
     task->time_slice = 10;
     task->first_run = true;
 
-    /* ------------------------------------------------------------
-     * Create a new address space
-     * ------------------------------------------------------------ */
+    /* Create a new address space */
     struct vmm_address_space *as = vmm_create_as();
     if (!as)
     {
@@ -266,13 +252,7 @@ task_t *task_create_user(const char *name, void *elf_data, uint32_t priority)
     task->address_space = as;
     task->page_directory = as->page_dir;
 
-    terminal_writestring("[TASK_CREATE_USER] Page directory: 0x");
-    terminal_write_hex((uint32_t)task->page_directory);
-    terminal_writestring("\n");
-
-    /* ------------------------------------------------------------
-     * Allocate kernel stack (page-aligned)
-     * ------------------------------------------------------------ */
+    /* Allocate kernel stack (page-aligned) */
     uint32_t raw_kstack = (uint32_t)kmalloc(4096 + 4096);
     if (!raw_kstack)
     {
@@ -284,13 +264,7 @@ task_t *task_create_user(const char *name, void *elf_data, uint32_t priority)
     task->kernel_stack_alloc = raw_kstack;
     task->kernel_stack = (raw_kstack + 0xFFF) & ~0xFFF;
 
-    terminal_writestring("[TASK_CREATE_USER] Kernel stack: 0x");
-    terminal_write_hex(task->kernel_stack);
-    terminal_writestring("\n");
-
-    /* ------------------------------------------------------------
-     * Allocate user stack (physical page)
-     * ------------------------------------------------------------ */
+    /* Allocate user stack (physical page) */
     uint32_t ustack_phys = (uint32_t)pmm_alloc_block();
     if (!ustack_phys)
     {
@@ -302,13 +276,7 @@ task_t *task_create_user(const char *name, void *elf_data, uint32_t priority)
 
     task->user_stack_phys = ustack_phys;
 
-    terminal_writestring("[TASK_CREATE_USER] User stack phys: 0x");
-    terminal_write_hex(ustack_phys);
-    terminal_writestring("\n");
-
-    /* ------------------------------------------------------------
-     * Map user stack INTO TASK ADDRESS SPACE
-     * ------------------------------------------------------------ */
+    /* Map user stack into task's address space */
     vmm_map_page_in_as(
         task->address_space,
         USER_STACK_TOP - PAGE_SIZE + 1,
@@ -318,13 +286,7 @@ task_t *task_create_user(const char *name, void *elf_data, uint32_t priority)
     task->user_esp = USER_STACK_TOP - 4;
     task->stack_bottom = USER_STACK_TOP - USER_STACK_SIZE;
 
-    terminal_writestring("[TASK_CREATE_USER] User ESP: 0x");
-    terminal_write_hex(task->user_esp);
-    terminal_writestring("\n");
-
-    /* ------------------------------------------------------------
-     * Load ELF
-     * ------------------------------------------------------------ */
+    /* Load ELF */
     if (!elf_load(task, elf_data))
     {
         vmm_unmap_page_in_as(task->address_space, USER_STACK_TOP - PAGE_SIZE);
@@ -335,25 +297,16 @@ task_t *task_create_user(const char *name, void *elf_data, uint32_t priority)
         return NULL;
     }
 
-    terminal_writestring("[TASK_CREATE_USER] ELF entry: 0x");
-    terminal_write_hex(task->entry_point);
-    terminal_writestring("\n");
-
-    /* ------------------------------------------------------------
-     * Build IRET frame
-     * ------------------------------------------------------------ */
+    /* Build IRET frame */
     task_setup_user_context(task);
 
-    /* ------------------------------------------------------------
-     * Parent / task list
-     * ------------------------------------------------------------ */
+    /* Set parent */
     if (current_task)
         task_add_child(current_task, task);
 
     task->next = task_list_head;
     task_list_head = task;
 
-    terminal_writestring("[TASK_CREATE_USER] ✓ User task created\n");
     return task;
 }
 
@@ -404,6 +357,9 @@ void task_setup_user_context(task_t *task)
     task->context.eip = task->entry_point;
 }
 
+/* Assembly helper to save kernel context and IRET to user mode */
+extern void task_switch_to_user_asm(task_t *old_task, task_t *new_task);
+
 /* ================================================================
  * TASK SWITCHING
  * ================================================================ */
@@ -413,228 +369,73 @@ void task_switch(task_t *new_task)
 
     if (!new_task || new_task == current_task)
     {
-        __asm__ volatile("sti"); // Re-enable if returning early
+        __asm__ volatile("sti");
         return;
     }
 
     task_t *old_task = current_task;
 
-    /* Update states */
+    /* If old task is exiting (ZOMBIE), don't save its context */
+    if (old_task && old_task->state == TASK_ZOMBIE)
+    {
+        /* Update states */
+        new_task->state = TASK_RUNNING;
+        current_task = new_task;
+
+        /* Switch page directory if different */
+        if (new_task->page_directory &&
+            (!old_task || new_task->page_directory != old_task->page_directory))
+        {
+            uint32_t phys = (uint32_t)new_task->page_directory;
+            __asm__ volatile("mov %0, %%cr3" ::"r"(phys));
+        }
+
+        /* Update TSS */
+        extern void tss_set_kernel_stack(uint32_t stack);
+        tss_set_kernel_stack(new_task->kernel_stack + 4096);
+
+        /* Don't save old task's context - it's dead anyway */
+        /* Load new task's context directly */
+        task_switch_and_die(new_task);
+        /* Never returns */
+    }
+
+    /* Normal context switch for non-exiting tasks */
     if (old_task && old_task->state == TASK_RUNNING)
         old_task->state = TASK_READY;
 
     new_task->state = TASK_RUNNING;
     current_task = new_task;
 
-    /* Debug output */
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_MAGENTA, VGA_COLOR_BLACK));
-    terminal_writestring("[SWITCH] Switching to PID ");
-    terminal_write_dec(new_task->pid);
-    terminal_writestring(" (");
-    terminal_writestring(new_task->name);
-    terminal_writestring(")\n");
-    terminal_writestring("[SWITCH] Ring=");
-    terminal_write_dec(new_task->ring);
-    terminal_writestring(", EIP=0x");
-    terminal_write_hex(new_task->context.eip);
-    terminal_writestring(", Entry=0x");
-    terminal_write_hex(new_task->entry_point);
-    terminal_writestring("\n");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-
-    /* ADD DELAY so you can read it */
-    for (volatile int i = 0; i < 10000000; i++)
-        ;
-
     /* Switch page directory if different */
     if (new_task->page_directory &&
         (!old_task || new_task->page_directory != old_task->page_directory))
     {
-        terminal_writestring("[SWITCH] Loading page directory 0x");
-        terminal_write_hex((uint32_t)new_task->page_directory);
-        terminal_writestring("\n");
-
-        for (volatile int i = 0; i < 10000000; i++)
-            ;
-
         uint32_t phys = (uint32_t)new_task->page_directory;
         __asm__ volatile("mov %0, %%cr3" ::"r"(phys));
-
-        terminal_writestring("[SWITCH] Page directory loaded\n");
-        for (volatile int i = 0; i < 10000000; i++)
-            ;
     }
 
     /* Update TSS */
     extern void tss_set_kernel_stack(uint32_t stack);
     tss_set_kernel_stack(new_task->kernel_stack + 4096);
 
-    /* USER MODE: Always IRET for ring 3 */
+    if (old_task == kernel_task && !kernel_task->context_saved)
+    {
+        kernel_task->context_saved = true;
+        /* Let task_switch_asm save kernel context */
+    }
+
+    /* USER MODE: Use assembly to save old context AND IRET to user mode */
     if (new_task->ring == 3 && new_task->first_run)
     {
-        terminal_writestring("[SWITCH] User mode - using IRET\n");
-        terminal_writestring("[SWITCH] ESP=0x");
-        terminal_write_hex(new_task->context.esp);
-        terminal_writestring("\n");
-
-        /* CRITICAL DEBUG: Show what's IN the IRET frame */
-        uint32_t *iret_frame = (uint32_t *)new_task->context.esp;
-        terminal_writestring("[IRET_FRAME] EIP=0x");
-        terminal_write_hex(iret_frame[0]);
-        terminal_writestring("\n");
-        terminal_writestring("[IRET_FRAME] CS=0x");
-        terminal_write_hex(iret_frame[1]);
-        terminal_writestring("\n");
-        terminal_writestring("[IRET_FRAME] EFLAGS=0x");
-        terminal_write_hex(iret_frame[2]);
-        terminal_writestring("\n");
-        terminal_writestring("[IRET_FRAME] User ESP=0x");
-        terminal_write_hex(iret_frame[3]);
-        terminal_writestring("\n");
-        terminal_writestring("[IRET_FRAME] SS=0x");
-        terminal_write_hex(iret_frame[4]);
-        terminal_writestring("\n");
-
-        for (volatile int i = 0; i < 50000000; i++)
-            ;
-
-        /* ========== NEW DEBUG: Verify stack is mapped ========== */
-        uint32_t stack_page = 0xBFFFF000; // The stack page
-        uint32_t pd_idx = stack_page >> 22;
-        uint32_t pt_idx = (stack_page >> 12) & 0x3FF;
-
-        terminal_writestring("[DEBUG] Checking stack page 0xBFFFF000\n");
-        terminal_writestring("[DEBUG] PD index: ");
-        terminal_write_dec(pd_idx);
-        terminal_writestring(", PT index: ");
-        terminal_write_dec(pt_idx);
-        terminal_writestring("\n");
-
-        uint32_t *check_pd = new_task->page_directory;
-        terminal_writestring("[DEBUG] PD entry for stack: 0x");
-        terminal_write_hex(check_pd[pd_idx]);
-        terminal_writestring("\n");
-
-        if (check_pd[pd_idx] & VMM_PRESENT)
-        {
-            uint32_t *pt = (uint32_t *)(check_pd[pd_idx] & ~0xFFF);
-            terminal_writestring("[DEBUG] PT entry for stack: 0x");
-            terminal_write_hex(pt[pt_idx]);
-            terminal_writestring("\n");
-        }
-        else
-        {
-            terminal_writestring("[ERROR] Stack page directory entry NOT PRESENT!\n");
-        }
-
-        /* Check current CS to verify we're in Ring 0 */
-        uint16_t current_cs;
-        __asm__ volatile("mov %%cs, %0" : "=r"(current_cs));
-        terminal_writestring("[DEBUG] Current CS before IRET: 0x");
-        terminal_write_hex(current_cs);
-        terminal_writestring("\n");
-
-        /* Also check if interrupts are disabled */
-        uint32_t eflags;
-        __asm__ volatile("pushf; pop %0" : "=r"(eflags));
-        terminal_writestring("[DEBUG] EFLAGS: 0x");
-        terminal_write_hex(eflags);
-        terminal_writestring("\n");
-
-        uint16_t current_ss;
-        __asm__ volatile("mov %%ss, %0" : "=r"(current_ss));
-        terminal_writestring("[DEBUG] Current SS before IRET: 0x");
-        terminal_write_hex(current_ss);
-        terminal_writestring("\n");
-
-        for (volatile int i = 0; i < 50000000; i++)
-            ;
-
-        /* ========== DEBUG: Dump first bytes at entry point ========== */
-        uint32_t entry = iret_frame[0];  /* EIP from IRET frame */
-        terminal_writestring("[DEBUG] Verifying code at entry point 0x");
-        terminal_write_hex(entry);
-        terminal_writestring(":\n");
-
-        /* Check code page mapping */
-        uint32_t code_pd_idx = entry >> 22;
-        uint32_t code_pt_idx = (entry >> 12) & 0x3FF;
-        terminal_writestring("[DEBUG] Code PD index: ");
-        terminal_write_dec(code_pd_idx);
-        terminal_writestring(", PT index: ");
-        terminal_write_dec(code_pt_idx);
-        terminal_writestring("\n");
-
-        terminal_writestring("[DEBUG] Code PD entry: 0x");
-        terminal_write_hex(check_pd[code_pd_idx]);
-        terminal_writestring("\n");
-
-        if (check_pd[code_pd_idx] & VMM_PRESENT)
-        {
-            uint32_t *code_pt = (uint32_t *)(check_pd[code_pd_idx] & ~0xFFF);
-            terminal_writestring("[DEBUG] Code PT entry: 0x");
-            terminal_write_hex(code_pt[code_pt_idx]);
-            terminal_writestring("\n");
-
-            /* Get physical address and read from there via identity map */
-            uint32_t code_phys = code_pt[code_pt_idx] & ~0xFFF;
-            terminal_writestring("[DEBUG] Code physical addr: 0x");
-            terminal_write_hex(code_phys);
-            terminal_writestring("\n");
-
-            /* Read from physical address (identity mapped) */
-            uint8_t *phys_code_ptr = (uint8_t *)code_phys;
-            terminal_writestring("[DEBUG] First 16 bytes (via phys): ");
-            for (int i = 0; i < 16; i++) {
-                terminal_write_hex(phys_code_ptr[i]);
-                terminal_putchar(' ');
-            }
-            terminal_writestring("\n");
-        }
-        else
-        {
-            terminal_writestring("[ERROR] Code page directory entry NOT PRESENT!\n");
-        }
-
-        /* Also try reading through virtual address after CR3 switch */
-        uint8_t *code_ptr = (uint8_t *)entry;
-        terminal_writestring("[DEBUG] First 16 bytes (via virt): ");
-        for (int i = 0; i < 16; i++) {
-            terminal_write_hex(code_ptr[i]);
-            terminal_putchar(' ');
-        }
-        terminal_writestring("\n");
-
-        for (volatile int i = 0; i < 50000000; i++)
-            ;
-
         new_task->first_run = false;
-        uint32_t esp_val = new_task->context.esp;
-
-        /* Zero all general purpose registers before IRET to avoid garbage */
-        __asm__ volatile(
-            "movl %[esp_val], %%esp\n\t"
-            "xorl %%eax, %%eax\n\t"
-            "xorl %%ebx, %%ebx\n\t"
-            "xorl %%ecx, %%ecx\n\t"
-            "xorl %%edx, %%edx\n\t"
-            "xorl %%esi, %%esi\n\t"
-            "xorl %%edi, %%edi\n\t"
-            "xorl %%ebp, %%ebp\n\t"
-            "iret\n\t"
-            : /* no outputs */
-            : [esp_val] "r"(esp_val)
-            : "memory");
-
-        // This should never execute if IRET works
-        terminal_writestring("[ERROR] IRET returned to kernel mode!\n");
-        while (1)
-            __asm__ volatile("hlt");
+        /* Use assembly function that saves old_task context then IRETs */
+        task_switch_to_user_asm(old_task, new_task);
+        /* When we return here, user task has finished and we're back */
+        return;
     }
-    /* Kernel mode */
-    terminal_writestring("[SWITCH] Kernel mode - using task_switch_asm\n");
-    for (volatile int i = 0; i < 10000000; i++)
-        ;
+
+    /* Kernel mode - use assembly context switch */
     task_switch_asm(old_task, new_task);
 }
 
@@ -644,6 +445,18 @@ void task_switch(task_t *new_task)
 task_t *task_current(void)
 {
     return current_task;
+}
+
+task_t *task_find_by_pid(uint32_t pid)
+{
+    task_t *task = task_list_head;
+    while (task)
+    {
+        if (task->pid == pid)
+            return task;
+        task = task->next;
+    }
+    return NULL;
 }
 
 /* ================================================================
@@ -656,18 +469,9 @@ void task_exit(int exit_code)
         return;
     }
 
+    /* Mark as zombie FIRST */
     current_task->state = TASK_ZOMBIE;
     current_task->exit_code = exit_code;
-
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_BROWN, VGA_COLOR_BLACK));
-    terminal_writestring("[TASK] Task '");
-    terminal_writestring(current_task->name);
-    terminal_writestring("' exited with code ");
-    char buf[16];
-    itoa(exit_code, buf);
-    terminal_writestring(buf);
-    terminal_writestring("\n");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
 
     /* Wake up parent if it's waiting */
     if (current_task->parent && current_task->parent->state == TASK_BLOCKED)
@@ -675,10 +479,18 @@ void task_exit(int exit_code)
         task_unblock(current_task->parent);
     }
 
-    task_yield();
-
-    while (1)
-        __asm__ volatile("hlt");
+    /* Switch to scheduler without saving context */
+    extern void task_switch_and_die(task_t *);
+    extern task_t *scheduler_pick_next(void);
+    
+    task_t *next = scheduler_pick_next();
+    if (!next) next = kernel_task;
+    
+    /* Don't use normal task_switch - it will try to save dead context */
+    task_switch_and_die(next);
+    
+    /* Never returns */
+    __builtin_unreachable();
 }
 
 void task_yield(void)
@@ -725,13 +537,17 @@ void task_destroy(task_t *task)
         return;
     }
 
+    /* Remove from scheduler's ready queue */
+    extern void scheduler_remove_task(task_t * task);
+    scheduler_remove_task(task);
+
     /* Remove from parent's child list */
     if (task->parent)
     {
         task_remove_child(task->parent, task);
     }
 
-    /* Remove from scheduler list */
+    /* Remove from task list */
     if (task_list_head == task)
     {
         task_list_head = task->next;
@@ -749,19 +565,10 @@ void task_destroy(task_t *task)
         }
     }
 
-    /* Free kernel stack */
+    /* Free kernel stack - both kernel and user tasks use kmalloc for kernel stacks */
     if (task->kernel_stack_alloc)
     {
-        if (task->ring == 3)
-        {
-            /* User task: allocated with vmm_alloc_page */
-            vmm_free_page((void *)task->kernel_stack_alloc);
-        }
-        else
-        {
-            /* Kernel task: allocated with kmalloc */
-            kfree((void *)task->kernel_stack_alloc);
-        }
+        kfree((void *)task->kernel_stack_alloc);
     }
 
     /* Free user stack and address space for user tasks */

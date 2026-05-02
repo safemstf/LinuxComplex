@@ -259,17 +259,6 @@ static int fat_node_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint8
     uint32_t cluster_size = fat_fs.sectors_per_cluster * 512;
     uint16_t cluster = data->first_cluster;
 
-    /* DEBUG: Show file read info */
-    terminal_writestring("[FAT_READ] File: ");
-    terminal_writestring(node->name);
-    terminal_writestring(" size=");
-    terminal_write_dec(node->size);
-    terminal_writestring(" first_cluster=");
-    terminal_write_dec(cluster);
-    terminal_writestring(" cluster_size=");
-    terminal_write_dec(cluster_size);
-    terminal_writestring("\n");
-
     /* Skip to offset */
     uint32_t skip = offset / cluster_size;
     for (uint32_t i = 0; i < skip && cluster < FAT_CLUSTER_EOC; i++)
@@ -281,28 +270,8 @@ static int fat_node_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint8
 
     int cluster_num = 0;
     while (bytes_read < size && cluster >= 2 && cluster < FAT_CLUSTER_EOC) {
-        /* DEBUG: Show each cluster being read (first few only) */
-        if (cluster_num < 5) {
-            terminal_writestring("[FAT_READ] Cluster ");
-            terminal_write_dec(cluster_num);
-            terminal_writestring(": cluster#=");
-            terminal_write_dec(cluster);
-            terminal_writestring(" LBA=");
-            terminal_write_dec(cluster_to_lba(cluster));
-            terminal_writestring("\n");
-        }
 
         if (fat_read_cluster(cluster, buf) < 0) break;
-
-        /* DEBUG: Show first 8 bytes of first few clusters */
-        if (cluster_num < 3) {
-            terminal_writestring("[FAT_READ] First 8 bytes: ");
-            for (int j = 0; j < 8; j++) {
-                terminal_write_hex(buf[j]);
-                terminal_putchar(' ');
-            }
-            terminal_writestring("\n");
-        }
 
         uint32_t to_read = cluster_size - cluster_offset;
         if (to_read > size - bytes_read) to_read = size - bytes_read;
@@ -313,13 +282,6 @@ static int fat_node_read(vfs_node_t *node, uint32_t offset, uint32_t size, uint8
         cluster = fat_get_next_cluster(cluster);
         cluster_num++;
     }
-
-    terminal_writestring("[FAT_READ] Total bytes_read=");
-    terminal_write_dec(bytes_read);
-    terminal_writestring(" clusters_read=");
-    terminal_write_dec(cluster_num);
-    terminal_writestring("\n");
-
     return bytes_read;
 }
 

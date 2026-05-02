@@ -26,28 +26,24 @@ int elf_validate(void *elf_data)
     /* Check 32-bit */
     if (ehdr->e_ident[4] != ELFCLASS32)
     {
-        terminal_writestring("[ELF] Error: Not a 32-bit ELF\n");
         return 0;
     }
 
     /* Check little endian */
     if (ehdr->e_ident[5] != ELFDATA2LSB)
     {
-        terminal_writestring("[ELF] Error: Not little endian\n");
         return 0;
     }
 
     /* Check executable */
     if (ehdr->e_type != ET_EXEC)
     {
-        terminal_writestring("[ELF] Error: Not an executable\n");
         return 0;
     }
 
     /* Check i386 */
     if (ehdr->e_machine != EM_386)
     {
-        terminal_writestring("[ELF] Error: Not for i386\n");
         return 0;
     }
 
@@ -69,21 +65,13 @@ uint32_t elf_get_entry(void *elf_data)
  */
 static void *map_user_page_accessible(task_t *task, uint32_t user_vaddr, uint32_t flags)
 {
-    /* FIRST THING - always print */
-    terminal_writestring("[MAP_CALL] vaddr=0x");
-    terminal_write_hex(user_vaddr);
-    terminal_writestring("\n");
+
 
     void *phys = pmm_alloc_block();
     if (!phys)
     {
-        terminal_writestring("[MAP_CALL] PMM alloc failed!\n");
         return NULL;
     }
-
-    terminal_writestring("[MAP_CALL] Got phys=0x");
-    terminal_write_hex((uint32_t)phys);
-    terminal_writestring("\n");
 
     uint32_t pd_idx = (user_vaddr >> 22) & 0x3FF;
     uint32_t pt_idx = (user_vaddr >> 12) & 0x3FF;
@@ -146,13 +134,6 @@ int elf_load(task_t *task, void *elf_data)
 
     elf32_ehdr_t *ehdr = (elf32_ehdr_t *)elf_data;
 
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_CYAN, VGA_COLOR_BLACK));
-    terminal_writestring("[ELF] Loading executable...\n");
-    terminal_writestring("[ELF] Entry point: 0x");
-    terminal_write_hex(ehdr->e_entry);
-    terminal_writestring("\n");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-
     /* Get program headers */
     elf32_phdr_t *phdr = (elf32_phdr_t *)((uint8_t *)elf_data + ehdr->e_phoff);
 
@@ -164,44 +145,16 @@ int elf_load(task_t *task, void *elf_data)
             continue; /* Skip non-loadable segments */
         }
 
-        terminal_writestring("[ELF] Loading segment ");
-        terminal_write_dec(i);
-        terminal_writestring(": vaddr=0x");
-        terminal_write_hex(phdr[i].p_vaddr);
-        terminal_writestring(" filesz=");
-        terminal_write_dec(phdr[i].p_filesz);
-        terminal_writestring(" memsz=");
-        terminal_write_dec(phdr[i].p_memsz);
-        terminal_writestring(" flags=");
-        if (phdr[i].p_flags & PF_R)
-            terminal_putchar('R');
-        if (phdr[i].p_flags & PF_W)
-            terminal_putchar('W');
-        if (phdr[i].p_flags & PF_X)
-            terminal_putchar('X');
-        terminal_writestring("\n");
-
         /* Calculate pages needed */
         uint32_t vaddr_start = phdr[i].p_vaddr & ~0xFFF;
         uint32_t vaddr_end = (phdr[i].p_vaddr + phdr[i].p_memsz + 0xFFF) & ~0xFFF;
         uint32_t num_pages = (vaddr_end - vaddr_start) / PAGE_SIZE;
 
-        terminal_writestring("[ELF]   Allocating ");
-        terminal_write_dec(num_pages);
-        terminal_writestring(" pages starting at 0x");
-        terminal_write_hex(vaddr_start);
-        terminal_writestring("\n");
 
         /* Map pages and copy data */
         for (uint32_t page_num = 0; page_num < num_pages; page_num++)
         {
             uint32_t user_vaddr = vaddr_start + page_num * PAGE_SIZE;
-
-            terminal_writestring("[ELF_LOOP] page ");
-            terminal_write_dec(page_num);
-            terminal_writestring(" vaddr=0x");
-            terminal_write_hex(user_vaddr);
-            terminal_writestring("\n");
 
             /* Determine flags */
             uint32_t flags = VMM_PRESENT | VMM_USER;
@@ -214,7 +167,6 @@ int elf_load(task_t *task, void *elf_data)
             void *kernel_addr = map_user_page_accessible(task, user_vaddr, flags);
             if (!kernel_addr)
             {
-                terminal_writestring("[ELF] ERROR: Out of memory\n");
                 return 0;
             }
 
@@ -243,30 +195,7 @@ int elf_load(task_t *task, void *elf_data)
                     uint8_t *src = (uint8_t *)elf_data + file_offset;
                     uint8_t *dst = (uint8_t *)kernel_addr + copy_start;
 
-                    /* DEBUG: Show what we're copying */
-                    terminal_writestring("[ELF_COPY] file_offset=0x");
-                    terminal_write_hex(file_offset);
-                    terminal_writestring(" copy_start=0x");
-                    terminal_write_hex(copy_start);
-                    terminal_writestring(" copy_size=0x");
-                    terminal_write_hex(copy_size);
-                    terminal_writestring("\n");
-                    terminal_writestring("[ELF_COPY] First 8 bytes from ELF: ");
-                    for (int j = 0; j < 8; j++) {
-                        terminal_write_hex(src[j]);
-                        terminal_putchar(' ');
-                    }
-                    terminal_writestring("\n");
-
-                    memcpy(dst, src, copy_size);
-
-                    /* Verify what was written */
-                    terminal_writestring("[ELF_COPY] First 8 bytes written: ");
-                    for (int j = 0; j < 8; j++) {
-                        terminal_write_hex(dst[j]);
-                        terminal_putchar(' ');
-                    }
-                    terminal_writestring("\n");
+                    memcpy(dst, src, copy_size);        
                 }
             }
 
@@ -295,9 +224,5 @@ int elf_load(task_t *task, void *elf_data)
 
     /* Set entry point - this is used by task_setup_user_context */
     task->entry_point = ehdr->e_entry; // ← Change from code_start
-    terminal_setcolor(vga_entry_color(VGA_COLOR_LIGHT_GREEN, VGA_COLOR_BLACK));
-    terminal_writestring("[ELF] ✓ Executable loaded successfully\n");
-    terminal_setcolor(vga_entry_color(VGA_COLOR_WHITE, VGA_COLOR_BLACK));
-
     return 1;
 }

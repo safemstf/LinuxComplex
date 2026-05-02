@@ -3,7 +3,11 @@
     "allow": [
       "Bash(xxd:*)",
       "Bash(make clean:*)",
-      "Bash(make)"
+      "Bash(make)",
+      "Bash(wsl make:*)",
+      "Bash(wsl make)",
+      "Bash(wsl -e bash -c \"cd '/mnt/c/Users/safeb/OneDrive/Documents/GitHub/OSComplex' && i686-elf-nm oscomplex.bin.elf 2>/dev/null | grep -i 171c 2>/dev/null | head -10\":*)",
+      "Bash(wsl -e bash -c:*)"
     ]
   }
 }
